@@ -1,0 +1,15 @@
+[package]
+name = "bamgen"
+version = "0.1.0"
+authors = ["wtzhang23 <wtzhang23@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rust-htslib = "*"
+rand = "*"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "*"
+clap = "3.0.0-beta.2"
+bio-types = "*"
