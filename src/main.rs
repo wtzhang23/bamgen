@@ -42,6 +42,10 @@ struct Construct {
     read_depth: usize,
     #[clap(long, default_value="10000")]
     read_count: usize,
+    #[clap(long)]
+    paired: bool,
+    #[clap(long, default_value=".9")]
+    percent_with_umi: f64,
     #[clap(long, default_value="12")]
     umi_len: usize,
     #[clap(long, default_value="5")]
@@ -52,6 +56,8 @@ struct Construct {
     min_ref_len: usize,
     #[clap(long, default_value="2000")]
     max_ref_len: usize,
+    #[clap(long, default_value="OX")]
+    umi_field: Vec<u8>,
     out_path: PathBuf,
     ground_truth: PathBuf
 }
@@ -77,6 +83,8 @@ impl Construct {
         }
 
         // get read distribution
+        let wumi_count = (self.read_count as f64 * self.percent_with_umi).floor() as usize;
+
         let mut indices = rand::seq::index::sample(&mut rng, self.read_count - 2, self.n_ref - 1).into_iter().map(|x| x + 1).collect::<Vec<usize>>();
         indices.sort();
 
@@ -119,11 +127,13 @@ impl Construct {
 
         let mut ground_truth = HashMap::<String, HashMap<usize, usize>>::new();
         let mut record = Record::new();
-        for (ri, (len, read_count)) in lengths.into_iter().zip(counts.into_iter()).enumerate() {
-            assert!(self.min_ref_len <= len && self.max_ref_len >= len);
+        for (ri, (reference_len, read_count)) in lengths.into_iter().zip(counts.into_iter()).enumerate() {
+            let has_umi = ri < wumi_count;
+            assert!(self.min_ref_len <= reference_len && self.max_ref_len >= reference_len);
             
+            // construct reference
             let ref_name = format!("ref{}", ri);
-            let reference = gen_seq(len, &mut rng);
+            let reference = gen_seq(reference_len, &mut rng);
             record.set_tid(ri as i32);
 
             // generate batches
@@ -136,6 +146,7 @@ impl Construct {
                 read_count - self.read_depth
             };
 
+            // construct batches per loci
             while count < max {
                 let c = (rng.gen::<usize>() % (self.read_depth - 1)) + 1;
                 batches.push(c);
@@ -144,70 +155,126 @@ impl Construct {
             batches.push(read_count - count);
 
             // generate indices for batch
-            let mut indices = rand::seq::index::sample(&mut rng, len - self.min_read_len, batches.len()).into_vec();
+            let mut indices = rand::seq::index::sample(&mut rng, reference_len - self.min_read_len, batches.len()).into_vec();
             indices.sort();
 
-            let mut umis = Box::new(HashMap::new());
-            for (group, pos) in batches.into_iter().zip(indices) {
-                record.set_pos(pos as i64);
-                for _r in 0..group {
-                    let len = rng.gen_range(self.min_read_len, std::cmp::min(len - pos, self.max_read_len));
-                    assert!(self.min_read_len <= len && self.max_read_len >= len);
+            if has_umi {
+                let mut umis = Box::new(HashMap::new());
+                for (batch_size, batch_pos) in batches.into_iter().zip(indices) {
+                    record.set_pos(batch_pos as i64);
 
-                    let seq = &reference[pos..(pos + len)];
+                    for _r in 0..batch_size { // generate batch_size # of reads
+                        let read_len = rng.gen_range(self.min_read_len, std::cmp::min(reference_len - batch_pos, self.max_read_len));
+                        assert!(self.min_read_len <= read_len && self.max_read_len >= read_len);
 
-                    umis.insert(gen_seq(self.umi_len, &mut rng), 1);
+                        let read_seq = &reference[batch_pos..(batch_pos + read_len)];
 
-                    // simulate PCR
-                    for _step in 0..self.pcr_steps {
-                        let mut new_umis = Box::new(HashMap::<String, usize>::new());
-                        for (umi, count) in umis.drain() {
-                            for _i in 0..(count << 1) {
-                                let mut new_umi = String::new();
-                                for c in umi.chars() {
-                                    let to_mut = rng.gen::<f32>() <= self.mut_rate;
-                                    if to_mut {
-                                        new_umi.push_str(&sample_nucleotide(&mut rng));
+                        umis.insert(gen_seq(self.umi_len, &mut rng), 1);
+
+                        // simulate PCR
+                        for _step in 0..self.pcr_steps {
+                            let mut new_umis = Box::new(HashMap::<String, usize>::new());
+                            for (umi, count) in umis.drain() {
+                                for _i in 0..(count << 1) {
+                                    let mut new_umi = String::new();
+                                    for c in umi.chars() {
+                                        let to_mut = rng.gen::<f32>() <= self.mut_rate;
+                                        if to_mut {
+                                            new_umi.push_str(&sample_nucleotide(&mut rng));
+                                        } else {
+                                            new_umi.push_str(&c.to_string());
+                                        }
+                                    }
+
+                                    if new_umis.contains_key(&new_umi) {
+                                        let count = new_umis.get(&new_umi).unwrap().to_owned();
+                                        new_umis.insert(new_umi, count + 1);
                                     } else {
-                                        new_umi.push_str(&c.to_string());
+                                        new_umis.insert(new_umi, 1);
                                     }
                                 }
+                            }
+                            umis = new_umis;
+                        }
 
-                                if new_umis.contains_key(&new_umi) {
-                                    let count = new_umis.get(&new_umi).unwrap().to_owned();
-                                    new_umis.insert(new_umi, count + 1);
-                                } else {
-                                    new_umis.insert(new_umi, 1);
+                        // write reads
+                        for (umi, count) in umis.drain() {
+                            for _i in 0..(count) {
+                                let qname = format!("read{}", read_id);
+
+                                record.set(qname.as_bytes(), None, read_seq.as_bytes(), &vec![255 as u8; read_seq.len()]);
+                                record.remove_aux(&self.umi_field);
+                                record.push_aux(&self.umi_field, &Aux::String(umi.as_bytes()));
+
+                                writer.write(&record).expect("Failed to write record.");
+
+                                if self.paired { // for pair
+                                    let pair_pos = rng.gen_range(0, reference_len - self.min_read_len);
+                                    let len = rng.gen_range(self.min_read_len, std::cmp::min(reference_len - pair_pos, self.max_read_len));
+                                    let pair_seq = &reference[pair_pos..pair_pos + len];
+
+                                    record.set(qname.as_bytes(), None, pair_seq.as_bytes(), &vec![255 as u8; pair_seq.len()]);
+                                    record.remove_aux(&self.umi_field);
+                                    writer.write(&record).expect("Failed to write record.");
                                 }
+                                read_id += 1;
                             }
                         }
-                        umis = new_umis;
                     }
 
-                    // write reads
-                    for (umi, count) in umis.drain() {
-                        for _i in 0..(count) {
+                    if let Some(pos_map) = ground_truth.get_mut(&ref_name) {
+                        assert!(!pos_map.contains_key(&batch_pos));
+                        pos_map.insert(batch_pos, batch_size);
+                    } else {
+                        let mut pos_map = HashMap::new();
+                        pos_map.insert(batch_pos, batch_size);
+                        ground_truth.insert(ref_name.clone(), pos_map);
+                    }
+                    assert_eq!(*ground_truth.get(&ref_name).unwrap().get(&batch_pos).unwrap(), batch_size);
+                }
+            } else {
+                for (batch_size, batch_pos) in batches.into_iter().zip(indices) {
+                    record.set_pos(batch_pos as i64);
+
+                    for _r in 0..batch_size { // generate batch_size # of reads
+                        let read_len = rng.gen_range(self.min_read_len, std::cmp::min(reference_len - batch_pos, self.max_read_len));
+                        assert!(self.min_read_len <= read_len && self.max_read_len >= read_len);
+
+                        let read_seq = &reference[batch_pos..(batch_pos + read_len)];
+                        let dup_count = 1 << self.pcr_steps; // skip simulating pcr; just write read
+                        
+                        // write reads
+                        for _i in 0..dup_count {
                             let qname = format!("read{}", read_id);
 
-                            record.set(qname.as_bytes(), None, seq.as_bytes(), &vec![255 as u8; seq.len()]);
-                            record.remove_aux(b"OX");
-                            record.push_aux(b"OX", &Aux::String(umi.as_bytes()));
-                            read_id += 1;
+                            record.set(qname.as_bytes(), None, read_seq.as_bytes(), &vec![255 as u8; read_seq.len()]);
+                            record.remove_aux(&self.umi_field);
 
                             writer.write(&record).expect("Failed to write record.");
+
+                            if self.paired { // for pair
+                                let pair_pos = rng.gen_range(0, reference_len - self.min_read_len);
+                                let len = rng.gen_range(self.min_read_len, std::cmp::min(reference_len - pair_pos, self.max_read_len));
+                                let pair_seq = &reference[pair_pos..pair_pos + len];
+
+                                record.set(qname.as_bytes(), None, pair_seq.as_bytes(), &vec![255 as u8; pair_seq.len()]);
+                                assert!(record.aux(&self.umi_field) == None); // should have been deleted above
+                                writer.write(&record).expect("Failed to write record.");
+                            }
+                            read_id += 1;
                         }
                     }
-                }
 
-                if let Some(pos_map) = ground_truth.get_mut(&ref_name) {
-                    assert!(!pos_map.contains_key(&pos));
-                    pos_map.insert(pos, group);
-                } else {
-                    let mut pos_map = HashMap::new();
-                    pos_map.insert(pos, group);
-                    ground_truth.insert(ref_name.clone(), pos_map);
+                    if let Some(pos_map) = ground_truth.get_mut(&ref_name) {
+                        assert!(!pos_map.contains_key(&batch_pos));
+                        pos_map.insert(batch_pos, batch_size);
+                    } else {
+                        let mut pos_map = HashMap::new();
+                        pos_map.insert(batch_pos, batch_size);
+                        ground_truth.insert(ref_name.clone(), pos_map);
+                    }
+                    assert_eq!(*ground_truth.get(&ref_name).unwrap().get(&batch_pos).unwrap(), batch_size);
                 }
-                assert_eq!(*ground_truth.get(&ref_name).unwrap().get(&pos).unwrap(), group);
             }
         }
 
