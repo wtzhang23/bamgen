@@ -1,0 +1,3 @@
+[submodule "umid-internals"]
+	path = umid-internals
+	url = git@github.com:wtzhang23/umid-internals.git
