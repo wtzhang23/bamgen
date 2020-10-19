@@ -1,4 +1,9 @@
 use std::path::*;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::prelude::*;
+use std::io::LineWriter;
+use std::cell::RefCell;
 use rust_htslib::bam::header::*;
 use rust_htslib::bam::Reader;
 use rust_htslib::bam::Writer;
@@ -7,12 +12,9 @@ use rust_htslib::bam::Format;
 use rust_htslib::bam::record::Aux;
 use rust_htslib::bam::Read;
 use rand::prelude::*;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::LineWriter;
 use clap::Clap;
 use bio_types::genome::AbstractInterval;
+use serde::{Serialize, Deserialize};
 
 #[derive(Clap)]
 #[clap(version = "1.0", author = "William Z. <wtzhang23@gmail.com>")]
@@ -26,6 +28,26 @@ impl Opts {
         match self {
             Opts::Construct(construct) => construct.run(),
             Opts::Diff(diff) => diff.run()
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Debug)]
+struct Loci(String, i64);
+
+#[derive(Serialize, Deserialize)]
+struct GroundTruth {
+    cpl_prior_duplication: HashMap::<Loci, usize>,
+    total_reads: usize,
+    reads_per_qname: HashMap::<Vec<u8>, usize>,
+}
+
+impl GroundTruth {
+    fn new() -> Self {
+        Self {
+            cpl_prior_duplication: HashMap::new(),
+            total_reads: 0,
+            reads_per_qname: HashMap::new(),
         }
     }
 }
@@ -57,15 +79,20 @@ struct Construct {
     #[clap(long, default_value="2000")]
     max_ref_len: usize,
     #[clap(long, default_value="OX")]
-    umi_field: Vec<u8>,
+    umi_tag: String,
     out_path: PathBuf,
     ground_truth: PathBuf
 }
 
 impl Construct {
     fn run(self) {
+        // ground truth
+        let ground_truth = RefCell::new(GroundTruth::new());
+
         // rng
         let mut rng = rand::thread_rng();
+
+        let umi_tag = self.umi_tag.as_bytes().to_owned();
         
         // construct header
         let mut header = Header::new();
@@ -99,6 +126,19 @@ impl Construct {
 
         // writer
         let mut writer = Writer::from_path(self.out_path, &header, Format::BAM).unwrap();
+        let mut write = |record: &Record| {
+            writer.write(record).expect("Failed to write record.");
+            let mut gt = ground_truth.borrow_mut();
+            gt.total_reads += 1;
+            let qname = record.qname().to_owned();
+
+            // for counts per qname
+            if let Some(count) = gt.reads_per_qname.get_mut(&qname) {
+                *count += 1;
+            } else {
+                gt.reads_per_qname.insert(qname, 1);
+            }
+        };
 
         // sequence generator
         let sample_nucleotide = |rng: &mut ThreadRng| {
@@ -124,8 +164,6 @@ impl Construct {
         };
 
         let mut read_id = 0;
-
-        let mut ground_truth = HashMap::<String, HashMap<usize, usize>>::new();
         let mut record = Record::new();
         for (ri, (reference_len, read_count)) in lengths.into_iter().zip(counts.into_iter()).enumerate() {
             let has_umi = ri < wumi_count;
@@ -199,14 +237,14 @@ impl Construct {
 
                         // write reads
                         for (umi, count) in umis.drain() {
-                            for _i in 0..(count) {
+                            for _i in 0..count {
                                 let qname = format!("read{}", read_id);
 
                                 record.set(qname.as_bytes(), None, read_seq.as_bytes(), &vec![255 as u8; read_seq.len()]);
-                                record.remove_aux(&self.umi_field);
-                                record.push_aux(&self.umi_field, &Aux::String(umi.as_bytes()));
+                                record.remove_aux(&umi_tag);
+                                record.push_aux(&umi_tag, &Aux::String(umi.as_bytes()));
 
-                                writer.write(&record).expect("Failed to write record.");
+                                write(&record);
 
                                 if self.paired { // for pair
                                     let pair_pos = rng.gen_range(0, reference_len - self.min_read_len);
@@ -214,23 +252,17 @@ impl Construct {
                                     let pair_seq = &reference[pair_pos..pair_pos + len];
 
                                     record.set(qname.as_bytes(), None, pair_seq.as_bytes(), &vec![255 as u8; pair_seq.len()]);
-                                    record.remove_aux(&self.umi_field);
-                                    writer.write(&record).expect("Failed to write record.");
+                                    record.remove_aux(&umi_tag);
+                                    write(&record);
                                 }
                                 read_id += 1;
                             }
                         }
+                        // write reads per loci
+                        let mut gt = ground_truth.borrow_mut();
+                        let loci = Loci(ref_name.clone(), batch_pos as i64);
+                        gt.cpl_prior_duplication.insert(loci, batch_size);
                     }
-
-                    if let Some(pos_map) = ground_truth.get_mut(&ref_name) {
-                        assert!(!pos_map.contains_key(&batch_pos));
-                        pos_map.insert(batch_pos, batch_size);
-                    } else {
-                        let mut pos_map = HashMap::new();
-                        pos_map.insert(batch_pos, batch_size);
-                        ground_truth.insert(ref_name.clone(), pos_map);
-                    }
-                    assert_eq!(*ground_truth.get(&ref_name).unwrap().get(&batch_pos).unwrap(), batch_size);
                 }
             } else {
                 for (batch_size, batch_pos) in batches.into_iter().zip(indices) {
@@ -248,9 +280,9 @@ impl Construct {
                             let qname = format!("read{}", read_id);
 
                             record.set(qname.as_bytes(), None, read_seq.as_bytes(), &vec![255 as u8; read_seq.len()]);
-                            record.remove_aux(&self.umi_field);
+                            record.remove_aux(&umi_tag);
 
-                            writer.write(&record).expect("Failed to write record.");
+                            write(&record);
 
                             if self.paired { // for pair
                                 let pair_pos = rng.gen_range(0, reference_len - self.min_read_len);
@@ -258,29 +290,26 @@ impl Construct {
                                 let pair_seq = &reference[pair_pos..pair_pos + len];
 
                                 record.set(qname.as_bytes(), None, pair_seq.as_bytes(), &vec![255 as u8; pair_seq.len()]);
-                                assert!(record.aux(&self.umi_field) == None); // should have been deleted above
-                                writer.write(&record).expect("Failed to write record.");
+                                assert!(record.aux(&umi_tag) == None); // should have been deleted above
+                                write(&record);
                             }
                             read_id += 1;
                         }
                     }
 
-                    if let Some(pos_map) = ground_truth.get_mut(&ref_name) {
-                        assert!(!pos_map.contains_key(&batch_pos));
-                        pos_map.insert(batch_pos, batch_size);
-                    } else {
-                        let mut pos_map = HashMap::new();
-                        pos_map.insert(batch_pos, batch_size);
-                        ground_truth.insert(ref_name.clone(), pos_map);
-                    }
-                    assert_eq!(*ground_truth.get(&ref_name).unwrap().get(&batch_pos).unwrap(), batch_size);
+                    // write reads per loci
+                    let mut gt = ground_truth.borrow_mut();
+                    let loci = Loci(ref_name.clone(), batch_pos as i64);
+                    gt.cpl_prior_duplication.insert(loci, batch_size);
                 }
             }
         }
 
         // write ground truth
         let mut file = File::create(&self.ground_truth).unwrap();
-        file.write_all(serde_json::to_string(&ground_truth).unwrap().as_bytes()).unwrap();
+        file.write_all(ron::to_string(&ground_truth).unwrap().as_bytes()).unwrap();
+
+        println!("Generated {} records\n", ground_truth.borrow().total_reads);
     }
 }
 
@@ -288,51 +317,85 @@ impl Construct {
 struct Diff {
     output_bam: PathBuf,
     ground_truth: PathBuf,
-    diff: PathBuf
+    diff: PathBuf,
+    #[clap(long)]
+    paired: bool,
+    #[clap(long, default_value="MI")]
+    group_tag: String,
 }
 
 impl Diff {
     fn run(self) {
         let contents = std::fs::read_to_string(&self.ground_truth).unwrap();
-        let ground_truth: HashMap<String, HashMap<usize, usize>> = serde_json::from_str(&contents).unwrap();
-        let mut to_compare = HashMap::<String, HashMap<usize, usize>>::new();
+        let mut ground_truth: GroundTruth = ron::from_str(&contents).unwrap();
+        let mut predicted_cpl = HashMap::<Loci, i64>::new();
+        let mut num_per_qname = HashMap::<Vec<u8>, usize>::new();
+        let mut group_ids = HashMap::<Vec<u8>, Option<i32>>::new();
 
-        // get predicted counts per position
         let mut reader = Reader::from_path(&self.output_bam).unwrap();
-        for record in reader.records().map(|r| r.unwrap()).filter(|r| !r.is_duplicate()) {
-            let pos = record.pos() as usize;
-            let reference = record.contig();
-            if let Some(pos_map) = to_compare.get_mut(reference) {
-                if let Some(count) = pos_map.get_mut(&pos) {
+        let mut count = 0;
+        for record in reader.records().map(|r| r.unwrap()) {
+            count += 1; // will keep track of number of records in file
+            
+            if let Some(count) = num_per_qname.get_mut(record.qname()) {
+                *count += 1;
+            } else {
+                num_per_qname.insert(record.qname().to_owned(), 1);
+            }
+
+            // get predicted counts per position
+            if !record.is_duplicate() {
+                let loci = Loci(record.contig().to_owned(), record.pos());
+                if let Some(count) = predicted_cpl.get_mut(&loci) {
                     *count += 1;
                 } else {
-                    pos_map.insert(pos, 1);
+                    predicted_cpl.insert(loci, 1);
                 }
-            } else {
-                let mut pos_map = HashMap::new();
-                pos_map.insert(pos, 1);
-                to_compare.insert(reference.to_owned(), pos_map);
+            }
+
+            // check paired to see if group ids agree
+            if self.paired {
+                if let Some(group_id) = record.aux(self.group_tag.as_bytes()) {
+                    let group_id = match group_id {
+                        Aux::String(i) => String::from_utf8(i.to_owned()).unwrap().parse::<i32>().unwrap(),
+                        _ => panic!("group id is supposed to be an integer.")
+                    };
+                    if let Some(other_id) = group_ids.get(record.qname()) {
+                        let other_id = other_id.expect("Read w/ same qname had no group id beforehand while this read does not.\n");
+                        assert_eq!(other_id, group_id, "Failed to transfer group id to paired read.");
+                    } else {
+                        group_ids.insert(record.qname().to_owned(), Some(group_id));
+                    }
+                } else {
+                    if let Some(_id) = group_ids.insert(record.qname().to_owned(), None) {
+                        panic!("Read q/ same qname had a group id beforehand while this read does not.\n");
+                    }
+                }
             }
         }
+        assert_eq!(count, ground_truth.total_reads, "Deduplication left out/added too much reads.");
+
+        // check that qnames match counts
+        for (qname, count) in num_per_qname.drain() {
+            let true_qname_count = ground_truth.reads_per_qname.remove(&qname).expect(&format!("qname {} does not exist in ground truth", &String::from_utf8(qname.clone()).unwrap()));
+            assert_eq!(count, true_qname_count, "qname {} lost some or gained some reads", &String::from_utf8(qname).unwrap());
+        }
+        assert!(ground_truth.reads_per_qname.is_empty());
 
         // align predicted w/ ground truths
         let mut aligned_counts = Vec::new();
-        for (reference, mut pos_map) in to_compare.drain() {
-            for (pos, count) in pos_map.drain() {
-                assert!(ground_truth.contains_key(&reference), "Reference {} not found.", reference);
-                let corr_pos_map = ground_truth.get(&reference).unwrap();
-                assert!(corr_pos_map.contains_key(&pos), "Position {} in Reference {} not found.", pos, reference);
-                let corresponding = corr_pos_map.get(&pos).unwrap();
-                aligned_counts.push((count, corresponding));
-            }
+        for (loci, count) in predicted_cpl.drain() {
+            let true_count = ground_truth.cpl_prior_duplication.remove(&loci).expect(&format!("Loci {:#?} not found.", loci));
+            aligned_counts.push((count, true_count, count as i64 - true_count as i64));
         }
+        assert!(ground_truth.cpl_prior_duplication.is_empty());
 
         let file = File::create(&self.diff).unwrap();
         let mut file = LineWriter::new(file);
         file.write_all(format!("{}\t{}\n", "output", "ground truth").as_bytes()).unwrap();
 
-        for (count, gt_count) in aligned_counts.into_iter() {
-            file.write_all(format!("{}\t{}\n", count, gt_count).as_bytes()).unwrap();
+        for (count, gt_count, diff) in aligned_counts.into_iter() {
+            file.write_all(format!("{}\t{}\t{}\n", count, gt_count, diff).as_bytes()).unwrap();
         }
     }
 }
